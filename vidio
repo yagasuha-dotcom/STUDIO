@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# vidio — kendali Studio dari Termux
+#   vidio setup                       simpan repo + token (sekali saja)
+#   vidio add <file.zip> [nama]       masukkan proyek Remotion ke Studio lalu push
+#   vidio run <nama> [opsi=nilai ..]  render di GitHub, tunggu, lalu unduh hasilnya
+#   vidio list                        daftar proyek
+#
+# Opsi untuk run (semua opsional):
+#   comp=ID  voice=id-ID-GadisNeural  rate=-8%  frames=0-450  scale=0.5
+#   tts=false  only_voice=true
+#
+# Contoh:
+#   vidio add /sdcard/Download/carnian-project.zip carnian
+#   vidio run carnian only_voice=true
+#   vidio run carnian frames=0-450 scale=0.5
+#   vidio run carnian
+set -e
+
+CFG="$HOME/.vidio"
+[ -f "$CFG" ] && . "$CFG"
+STUDIO_DIR="${STUDIO_DIR:-$HOME/studio}"
+REPO="${REPO:-yagasuha-dotcom/STUDIO}"
+OUT="${OUT:-/sdcard/Download/vidio}"
+API="https://api.github.com/repos/$REPO"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' belum terpasang. Jalankan: pkg install $1"; }
+api() { curl -sS -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+
+cmd_setup() {
+  need git; need curl; need jq; need unzip
+  read -rp "Repo GitHub [${REPO}]: " r
+  [ -n "$r" ] && REPO="$r"
+  read -rsp "Token GitHub (scope repo + workflow): " TOKEN; echo
+  [ -n "$TOKEN" ] || die "Token kosong"
+  read -rp "Folder Studio di HP [${STUDIO_DIR}]: " d
+  [ -n "$d" ] && STUDIO_DIR="$d"
+  { echo "REPO=\"$REPO\""; echo "TOKEN=\"$TOKEN\""; echo "STUDIO_DIR=\"$STUDIO_DIR\""; } > "$CFG"
+  chmod 600 "$CFG"
+  if [ -d "$STUDIO_DIR/.git" ]; then
+    git -C "$STUDIO_DIR" remote set-url origin "https://${REPO%%/*}:${TOKEN}@github.com/${REPO}.git"
+    echo "Remote git di $STUDIO_DIR sudah memakai token (tidak akan minta password lagi)."
+  else
+    echo "PERINGATAN: $STUDIO_DIR belum berupa repo git. Siapkan dulu sesuai panduan."
+  fi
+  echo "Beres. Cek dengan: vidio list"
+}
+
+cmd_list() {
+  [ -d "$STUDIO_DIR/projects" ] || die "Folder $STUDIO_DIR/projects tidak ada"
+  ls -1 "$STUDIO_DIR/projects"
+}
+
+cmd_add() {
+  need git; need unzip
+  zip="$1"; name="$2"
+  [ -n "$zip" ] || die "Pemakaian: vidio add <file.zip> [nama]"
+  [ -f "$zip" ] || die "File tidak ditemukan: $zip"
+  [ -d "$STUDIO_DIR/.git" ] || die "$STUDIO_DIR bukan repo git (jalankan vidio setup)"
+  [ -n "$name" ] || name="$(basename "$zip" .zip)"
+  name="$(echo "$name" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9_-')"
+  [ -n "$name" ] || die "Nama proyek tidak valid"
+
+  tmp="$(mktemp -d)"
+  unzip -q "$zip" -d "$tmp"
+  rm -rf "$tmp/__MACOSX"
+  src="$tmp"
+  # kalau isi zip dibungkus satu folder, masuk ke dalamnya
+  if [ ! -f "$src/package.json" ]; then
+    n=$(find "$src" -mindepth 1 -maxdepth 1 | wc -l)
+    d=$(find "$src" -mindepth 1 -maxdepth 1 -type d | head -1)
+    if [ "$n" -eq 1 ] && [ -n "$d" ]; then src="$d"; fi
+  fi
+  [ -f "$src/package.json" ] || { rm -rf "$tmp"; die "package.json tidak ditemukan di zip (bukan proyek Remotion?)"; }
+  rm -rf "$src/node_modules" "$src/out" "$src/.git"
+
+  cd "$STUDIO_DIR"
+  mkdir -p projects
+  rm -rf "projects/$name"
+  cp -r "$src" "projects/$name"
+  rm -rf "$tmp"
+
+  git add -A "projects/$name"
+  if git commit -q -m "proyek $name" >/dev/null 2>&1; then
+    git pull -q --rebase --autostash 2>/dev/null || true
+    git push -q
+    echo "Proyek '$name' terkirim ke GitHub."
+  else
+    echo "Tidak ada perubahan untuk proyek '$name'."
+  fi
+}
+
+cmd_run() {
+  need curl; need jq; need unzip
+  [ -n "$TOKEN" ] || die "Token belum diatur. Jalankan: vidio setup"
+  name="$1"; shift || true
+  [ -n "$name" ] || die "Pemakaian: vidio run <nama> [opsi=nilai ...]"
+
+  inputs=$(jq -n --arg p "$name" '{project:$p}')
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    [ "$k" = "comp" ] && k="composition"
+    inputs=$(echo "$inputs" | jq --arg k "$k" --arg v "$v" '. + {($k):$v}')
+  done
+  body=$(jq -n --argjson i "$inputs" '{ref:"main",inputs:$i}')
+
+  since=$(date -u -d '-90 seconds' +%Y-%m-%dT%H:%M:%SZ)
+  code=$(api -o /tmp/vidio_resp -w '%{http_code}' -X POST "$API/actions/workflows/render.yml/dispatches" -d "$body")
+  if [ "$code" != "204" ]; then cat /tmp/vidio_resp; echo; die "Gagal memicu workflow (HTTP $code)"; fi
+  echo "Workflow dimulai untuk '$name'..."
+
+  run=""
+  for _ in $(seq 1 20); do
+    sleep 4
+    run=$(api -G --data-urlencode "created=>=$since" "$API/actions/runs?event=workflow_dispatch&per_page=1" \
+          | jq -r '.workflow_runs[0].id // empty')
+    [ -n "$run" ] && break
+  done
+  [ -n "$run" ] || die "Run tidak ketemu. Cek tab Actions di GitHub."
+  echo "Pantau: https://github.com/$REPO/actions/runs/$run"
+
+  while :; do
+    info=$(api "$API/actions/runs/$run")
+    st=$(echo "$info" | jq -r '.status')
+    concl=$(echo "$info" | jq -r '.conclusion // ""')
+    printf '\rStatus: %-12s' "$st"
+    [ "$st" = "completed" ] && break
+    sleep 20
+  done
+  echo
+  [ "$concl" = "success" ] || die "Run selesai dengan status '$concl'. Buka link di atas untuk lihat lognya."
+
+  dest="$OUT/$name"
+  mkdir -p "$dest"
+  api "$API/actions/runs/$run/artifacts" | jq -r '.artifacts[] | "\(.id) \(.name)"' | while read -r id an; do
+    echo "Mengunduh $an ..."
+    api -L -o "$dest/$an.zip" "$API/actions/artifacts/$id/zip"
+    mkdir -p "$dest/$an"
+    unzip -oq "$dest/$an.zip" -d "$dest/$an" && rm -f "$dest/$an.zip"
+  done
+  echo "Selesai. Hasil ada di: $dest"
+}
+
+case "${1:-}" in
+  setup) cmd_setup ;;
+  list)  cmd_list ;;
+  add)   shift; cmd_add "$@" ;;
+  run)   shift; cmd_run "$@" ;;
+  *)     sed -n '2,17p' "$0" ;;
+esac

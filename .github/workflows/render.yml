@@ -1,0 +1,141 @@
+name: Render video
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Nama folder proyek di projects/ (contoh: carnian)"
+        required: true
+      composition:
+        description: "ID composition (kosongkan = otomatis)"
+        required: false
+        default: ""
+      tts:
+        description: "Buat voice otomatis kalau proyek punya naskah"
+        type: boolean
+        default: true
+      only_voice:
+        description: "Hanya buat voice (tanpa render video)"
+        type: boolean
+        default: false
+      voice:
+        description: "Suara bawaan (bisa diganti per kalimat di narration.txt)"
+        type: string
+        default: id-ID-ArdiNeural
+      rate:
+        description: "Kecepatan bicara, contoh +0% / -8% / +10%"
+        required: false
+        default: "+0%"
+      frames:
+        description: "Opsional, tes cepat. Contoh: 0-450 (kosongkan = render penuh)"
+        required: false
+        default: ""
+      scale:
+        description: "Skala resolusi (1 = penuh, 0.5 = tes cepat)"
+        required: false
+        default: "1"
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      PROJECT: ${{ inputs.project }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Baca proyek
+        id: detect
+        env:
+          WANTED: ${{ inputs.composition }}
+        run: python3 tools/studio.py detect "projects/$PROJECT" "$WANTED"
+
+      - name: Buat voice (TTS)
+        if: ${{ inputs.tts && steps.detect.outputs.mode != 'none' }}
+        env:
+          TTS_VOICE: ${{ inputs.voice }}
+          TTS_RATE: ${{ inputs.rate }}
+          MODE: ${{ steps.detect.outputs.mode }}
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install edge-tts
+          if [ "$MODE" = "template" ]; then
+            (cd "projects/$PROJECT" && python tools/tts.py)
+          else
+            python tools/studio.py overlay-tts "projects/$PROJECT" out
+          fi
+
+      - name: Upload voice dan timing
+        if: ${{ inputs.tts && steps.detect.outputs.mode != 'none' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-${{ inputs.project }}
+          if-no-files-found: ignore
+          path: |
+            projects/${{ inputs.project }}/public/voice_1.mp3
+            projects/${{ inputs.project }}/public/voice_2.mp3
+            projects/${{ inputs.project }}/src/timing.json
+            out/voice.mp3
+            out/voice_timing.json
+          retention-days: 7
+
+      - uses: actions/setup-node@v4
+        if: ${{ !inputs.only_voice }}
+        with:
+          node-version: 22
+
+      - name: Install dependensi sistem untuk Chrome
+        if: ${{ !inputs.only_voice }}
+        run: |
+          sudo apt-get install -y libnss3 libdbus-1-3 libatk1.0-0 libasound2t64 \
+            libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 libxdamage1 \
+            libgbm-dev libcups2 libatk-bridge2.0-0 libpango-1.0-0 libcairo2
+
+      - name: Render
+        if: ${{ !inputs.only_voice }}
+        working-directory: projects/${{ inputs.project }}
+        env:
+          COMP: ${{ steps.detect.outputs.comp }}
+          USES3D: ${{ steps.detect.outputs.uses3d }}
+          SCALE: ${{ inputs.scale }}
+          FRAMES: ${{ inputs.frames }}
+        run: |
+          npm install --no-audit --no-fund
+          npx remotion browser ensure
+          mkdir -p out
+          if [ "$USES3D" = "true" ]; then
+            ARGS="--gl=swangle --concurrency=2 --timeout=300000"
+          else
+            ARGS="--concurrency=100% --timeout=120000"
+          fi
+          ARGS="$ARGS --codec=h264 --crf=18 --scale=$SCALE"
+          if [ -n "$FRAMES" ]; then ARGS="$ARGS --frames=$FRAMES"; fi
+          npx remotion render "$COMP" out/video.mp4 $ARGS
+
+      - name: Gabung voice ke video
+        if: ${{ !inputs.only_voice && inputs.tts && steps.detect.outputs.mode == 'overlay' }}
+        run: python3 tools/studio.py mix "projects/$PROJECT/out/video.mp4" out/voice.mp3 "projects/$PROJECT/out/final.mp4"
+
+      - name: Siapkan hasil
+        if: ${{ !inputs.only_voice }}
+        run: |
+          mkdir -p result
+          if [ -f "projects/$PROJECT/out/final.mp4" ]; then
+            cp "projects/$PROJECT/out/final.mp4" "result/$PROJECT.mp4"
+          else
+            cp "projects/$PROJECT/out/video.mp4" "result/$PROJECT.mp4"
+          fi
+
+      - name: Upload video
+        if: ${{ !inputs.only_voice }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ inputs.project }}
+          path: result/${{ inputs.project }}.mp4
+          retention-days: 7
