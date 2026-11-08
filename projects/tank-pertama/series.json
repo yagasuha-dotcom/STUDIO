@@ -1,0 +1,14 @@
+{
+  "gaya": "A — Diorama Karakter",
+  "format": "1080x1920 @30fps",
+  "suara": {"voice": "id-ID-ArdiNeural", "rate": "+0%"},
+  "font": "Montserrat",
+  "palet": {"ink": "#2a1d14", "khaki": "#b9a35a", "brown": "#8a5a2b", "steel": "#6f8faf", "aksen": "#ffbf5e"},
+  "karakter": {
+    "komandan": {"hat": "officer", "hatColor": "khaki", "mustache": true},
+    "awak": {"hat": "cap", "hatColor": "brown"},
+    "teknisi": {"hat": "helmet", "hatColor": "steel", "outfit": "steel"},
+    "musuh": {"hat": "helmet", "hatColor": "#5e6554", "outfit": "#7c8274"}
+  },
+  "hashtag_dasar": ["#sejarah", "#faktaunik", "#fyp"]
+}
